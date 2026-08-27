@@ -1,0 +1,13 @@
+torch
+torchvision
+transformers
+albumentations
+opencv-python
+kagglehub
+pillow
+numpy
+pandas
+scikit-learn
+matplotlib
+pyyaml
+tqdm

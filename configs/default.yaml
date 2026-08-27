@@ -1,0 +1,9 @@
+model_id: facebook/dinov2-base
+batch_size: 32
+epochs: 30
+learning_rate: 0.001
+val_split: 0.15
+manifest_path: 
+embeddings_path: 
+head_path: 
+outputs_dir: 

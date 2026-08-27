@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific
+outputs/*
+!outputs/.gitkeep
+*.npz
+*.npy
+*.pt
+*.pth
+data/
+.DS_Store
