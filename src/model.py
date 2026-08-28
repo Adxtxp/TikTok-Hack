@@ -19,6 +19,9 @@ Label convention (from the manifest): 0 = real, 1 = fake. So the sigmoid of
 the logit is P(fake).
 """
 
+import importlib
+import pickle
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -126,29 +129,150 @@ def save_head(model, path, extra=None):
         path: destination .pt path.
         extra: optional dict of metadata to embed (e.g. metrics, config).
     """
+    in_dim = getattr(model, "in_dim", None)
+    hidden = getattr(model, "hidden", DEFAULT_HIDDEN)
+    dropout = getattr(model, "dropout", DEFAULT_DROPOUT)
+
+    # Explicit casts to plain Python types. Any numpy-flavoured value pickled
+    # here (a np.float64 metric, a np.int64 dimension) becomes a
+    # `numpy._core.multiarray.scalar` global in the archive, which torch's
+    # strict weights_only unpickler refuses to reconstruct - see _torch_load.
     ckpt = {
         "state_dict": model.state_dict(),
-        "in_dim": getattr(model, "in_dim", None),
-        "hidden": getattr(model, "hidden", DEFAULT_HIDDEN),
-        "dropout": getattr(model, "dropout", DEFAULT_DROPOUT),
+        "in_dim": None if in_dim is None else int(in_dim),
+        "hidden": int(hidden),
+        "dropout": float(dropout),
     }
     if extra:
-        ckpt["extra"] = extra
+        # In practice this is where the numpy scalars actually come from:
+        # callers pass metrics straight through from sklearn, and older
+        # sklearn returns np.float64 from accuracy_score / roc_auc_score.
+        # Coerced recursively, so no numpy object reaches the pickle no matter
+        # what the caller hands over.
+        ckpt["extra"] = _to_plain_python(extra)
+
     torch.save(ckpt, path)
 
 
-def _torch_load(path, map_location):
-    """torch.load across versions.
+def _to_plain_python(obj):
+    """Recursively convert numpy scalars/arrays into plain Python equivalents.
 
-    torch >= 2.6 flipped ``weights_only`` to True by default. Our checkpoint
-    holds only tensors, ints and floats, so it loads fine either way; the
-    try/except just keeps the explicit flag from breaking older torch that
-    doesn't accept the kwarg.
+    Applied to checkpoint metadata before pickling. Containers are walked, so a
+    nested dict of metrics is handled and not just top-level values.
+    """
+    # numpy scalar (np.float64, np.int64, np.bool_, ...) -> float / int / bool
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {_to_plain_python(k): _to_plain_python(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return type(obj)(_to_plain_python(v) for v in obj)
+    return obj
+
+
+def _numpy_safe_globals():
+    """numpy globals a legacy checkpoint may reference, for the allowlist.
+
+    Built defensively: the private scalar-reconstruction helper moved from
+    ``numpy.core.multiarray`` (numpy 1.x) to ``numpy._core.multiarray``
+    (numpy 2.x), and the concrete dtype classes differ by version, so anything
+    absent is skipped rather than raising at import time.
+    """
+    allow = []
+
+    for mod_name in ("numpy._core.multiarray", "numpy.core.multiarray"):
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001 - a missing/renamed module is expected
+            continue
+        fn = getattr(mod, "scalar", None)
+        if fn is not None:
+            allow.append(fn)
+
+    # Reconstructing a scalar also pulls in its dtype.
+    allow.append(np.dtype)
+    for name in ("float64", "float32", "int64", "int32", "bool_"):
+        t = getattr(np, name, None)
+        if t is not None:
+            allow.append(t)
+
+    dtypes_mod = getattr(np, "dtypes", None)
+    if dtypes_mod is not None:
+        for name in ("Float64DType", "Float32DType", "Int64DType", "Int32DType",
+                     "BoolDType"):
+            t = getattr(dtypes_mod, name, None)
+            if t is not None:
+                allow.append(t)
+
+    return allow
+
+
+def _torch_load(path, map_location):
+    """torch.load, robust across torch versions and checkpoint vintages.
+
+    WHY THIS IS NOT JUST torch.load()
+    ---------------------------------
+    torch 2.6 flipped the ``weights_only`` default from False to True. Under
+    the strict unpickler only a small allowlist of types can be
+    reconstructed, so a checkpoint whose *metadata* holds a numpy scalar now
+    fails with:
+
+        _pickle.UnpicklingError: Weights only load failed ...
+        Unsupported global: GLOBAL numpy._core.multiarray.scalar was not an
+        allowed global by default
+
+    The weights themselves are fine - it is the metadata dict beside them that
+    trips the check. ``save_head`` no longer writes numpy objects, but head
+    files saved before that fix still exist, and retraining purely to reload
+    them would be absurd. So this degrades in three steps:
+
+      1. strict ``weights_only=True``           - new files; no trust needed
+      2. strict + numpy scalars allowlisted     - legacy files, still strict
+                                                  about everything else
+      3. ``weights_only=False``, with a warning - last resort, full unpickle
+
+    Step 3 executes arbitrary pickled code, which is why it is last, loud, and
+    reached only for files the first two steps cannot read. These are your own
+    checkpoints, so that is acceptable here - it would not be for a checkpoint
+    downloaded from a stranger.
     """
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
+        # torch too old to know the kwarg at all; its default is a full
+        # unpickle, so nothing further is needed.
         return torch.load(path, map_location=map_location)
+    except (pickle.UnpicklingError, RuntimeError) as exc:
+        # RuntimeError as well as UnpicklingError: some torch versions wrap
+        # the weights-only failure rather than raising it directly.
+        strict_error = exc
+
+    # Step 2: allowlist just the numpy globals, keeping the strict unpickler.
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is not None:
+        try:
+            with safe_globals(_numpy_safe_globals()):
+                return torch.load(path, map_location=map_location,
+                                  weights_only=True)
+        except Exception:  # noqa: BLE001 - fall through to the last resort
+            pass
+
+    # Step 3: full unpickle, announced. The wording stays non-committal about
+    # the cause: reaching here usually means a legacy numpy-containing file,
+    # but a genuinely corrupt archive lands here too and must not be
+    # mis-described as merely out of date.
+    print(
+        f"WARNING: {path} could not be read by the strict (weights_only) "
+        f"loader:\n"
+        f"  {type(strict_error).__name__}: "
+        f"{str(strict_error).splitlines()[0]}\n"
+        f"  Retrying with weights_only=False. If this is an older head file, "
+        f"re-save it with save_head() to get a portable one; if the load still "
+        f"fails, the file is unreadable rather than merely out of date."
+    )
+    return torch.load(path, map_location=map_location, weights_only=False)
 
 
 def load_head(path, map_location="cpu"):
