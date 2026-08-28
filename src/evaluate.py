@@ -38,6 +38,8 @@ import sys
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
+# tqdm.auto renders as a widget in Colab and a text bar under `python -m`.
+from tqdm.auto import tqdm
 
 try:
     from src.features import get_embedder, get_fused_embeddings
@@ -149,7 +151,12 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
 
     rows, probs_by_transform = [], {}
 
-    for name in transform_names:
+    # Outer bar counts transforms (x/15), so it's obvious how far through the
+    # sweep you are; the per-batch bar from get_fused_embeddings nests inside
+    # it and shows progress within the current transform.
+    sweep = tqdm(transform_names, desc="Evaluating transforms", unit="transform")
+
+    for name in sweep:
         # ---- the eval loop, one iteration per degradation --------------
         # Each iteration is a full re-extraction: every eval image is opened,
         # degraded by `name`, and pushed through DINOv2 + FFT again. The head
@@ -187,7 +194,12 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
 
         rows.append({"transform": name, "accuracy": acc, "auc": auc})
         probs_by_transform[name] = probs
-        print(f"  {name:<14} accuracy {acc:.4f}   auc {auc:.4f}")
+        # tqdm.write instead of print: a bare print() while a bar is live
+        # interleaves with the bar's carriage returns and garbles both. Same
+        # text, just routed so tqdm can redraw around it.
+        tqdm.write(f"  {name:<14} accuracy {acc:.4f}   auc {auc:.4f}")
+        # Keeps the latest score visible on the bar itself.
+        sweep.set_postfix(acc=f"{acc:.4f}", auc=f"{auc:.4f}")
 
     results_df = pd.DataFrame(rows).set_index("transform")
 

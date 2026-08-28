@@ -46,7 +46,9 @@ the fused matrix would change results.
 import numpy as np
 import torch
 from PIL import Image
-from tqdm import tqdm
+# tqdm.auto picks the ipywidgets bar in a notebook and the plain terminal bar
+# in a script, so the same call renders correctly in Colab and on the CLI.
+from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoModel
 
 # apply_transform lives in the sibling module. The `src.` form is the intended
@@ -253,9 +255,21 @@ def get_fused_embeddings(
     """
     embedder = embedder or get_embedder(model_id)
 
+    # The slowest loop in the pipeline: one DINOv2 forward pass per batch, so
+    # thousands of them over a full manifest. The bar is what distinguishes
+    # "still working" from "hung" on a long Colab run.
+    #
+    # leave=False so the finished bar is erased - this function is called once
+    # per transform by the 15-transform sweep in src/evaluate.py, and 15
+    # leftover bars would bury the results table.
     batch_starts = range(0, len(image_paths), batch_size)
     if show_progress:
-        batch_starts = tqdm(batch_starts, desc=f"embed[{transform_name}]")
+        batch_starts = tqdm(
+            batch_starts,
+            desc=f"Extracting features [{transform_name}]",
+            unit="batch",
+            leave=False,
+        )
 
     all_embeddings = []
     for i in batch_starts:

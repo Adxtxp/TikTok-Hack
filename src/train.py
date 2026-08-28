@@ -45,6 +45,8 @@ import torch.optim as optim
 import yaml
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+# tqdm.auto renders as a widget in Colab and a text bar under `python -m`.
+from tqdm.auto import tqdm
 
 # Support both `python -m src.train` (package) and `python src/train.py`.
 try:
@@ -259,7 +261,18 @@ def train(
         perm = torch.randperm(n, generator=gen)
 
         epoch_loss, n_batches = 0.0, 0
-        for start in range(0, n, batch_size):
+
+        # Intra-epoch progress. leave=False erases each epoch's bar once it
+        # finishes, so the per-epoch metric lines below stay the permanent
+        # record instead of being separated by 30 spent bars.
+        batches = tqdm(
+            range(0, n, batch_size),
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            leave=False,
+        )
+
+        for start in batches:
             sel = perm[start:start + batch_size]
             xb, yb = Xt[sel].to(device), yt[sel].to(device)
 
@@ -270,6 +283,9 @@ def train(
 
             epoch_loss += loss.item()
             n_batches += 1
+            # Running mean loss on the bar, so a diverging run is visible
+            # immediately rather than only at the end-of-epoch print.
+            batches.set_postfix(loss=f"{epoch_loss / n_batches:.4f}")
 
         train_loss = epoch_loss / max(1, n_batches)
 
