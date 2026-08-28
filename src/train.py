@@ -45,18 +45,21 @@ import torch.optim as optim
 import yaml
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 # tqdm.auto renders as a widget in Colab and a text bar under `python -m`.
 from tqdm.auto import tqdm
 
 # Support both `python -m src.train` (package) and `python src/train.py`.
 try:
     from src.features import FUSED_DIM, get_fused_embeddings, load_embeddings, save_embeddings
-    from src.model import Head, predict_proba, save_head
+    from src.model import (Head, apply_scaler, predict_proba, save_head,
+                           save_scaler, scaler_path_for)
     from src.transforms import TRANSFORM_NAMES
 except ImportError:  # pragma: no cover - sys.path shape, not logic
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.features import FUSED_DIM, get_fused_embeddings, load_embeddings, save_embeddings
-    from src.model import Head, predict_proba, save_head
+    from src.model import (Head, apply_scaler, predict_proba, save_head,
+                           save_scaler, scaler_path_for)
     from src.transforms import TRANSFORM_NAMES
 
 DEFAULT_CONFIG = os.path.join(
@@ -319,6 +322,14 @@ def parse_args(argv=None):
     p.add_argument("--augment", action="store_true",
                    help="Apply a random transform per training image before feature "
                         "extraction, to train for robustness. Validation stays clean.")
+    p.add_argument("--normalize", action="store_true",
+                   help="Z-score each feature dimension. The scaler is fit on the "
+                        "TRAINING features only and saved beside the head, so "
+                        "evaluate/inference reuse the identical transform. Default "
+                        "off, leaving the un-normalized baseline unchanged.")
+    p.add_argument("--scaler-out", default=None,
+                   help="Where to write the fitted scaler (default: alongside "
+                        "--out, as <head>.scaler.pkl). Only used with --normalize.")
     # Extras with config-backed defaults.
     p.add_argument("--config", default=DEFAULT_CONFIG, help="YAML config path.")
     p.add_argument("--embeddings", default=None,
@@ -413,6 +424,31 @@ def main(argv=None):
         X_train, y_train = X[train_idx], y[train_idx]
         X_val, y_val = X[val_idx], y[val_idx]
 
+    # ---- optional feature normalization (the --normalize experiment) ----
+    # Placed here, after all three feature-assembly branches have converged on
+    # (X_train, X_val), so there is exactly one place scaling can happen and
+    # no branch can accidentally skip it.
+    #
+    # THE CORRECTNESS PROPERTY: fit on X_train ONLY, then transform val with
+    # that same fitted scaler. Fitting on val (or on the concatenation) would
+    # let the validation set's mean/std inform the transform, which inflates
+    # the val metric and makes it useless as a held-out estimate. The test set
+    # is not even present in this process.
+    scaler = None
+    if args.normalize:
+        scaler = StandardScaler()
+        scaler.fit(X_train)                       # <- train only
+        X_train = apply_scaler(scaler, X_train)   # <- transform
+        X_val = apply_scaler(scaler, X_val)       # <- same fitted scaler
+        print(f"\nnormalize: z-scored {X_train.shape[1]} dims "
+              f"(scaler fit on {len(X_train)} train rows only)")
+        print(f"  pre-fit train mean range:  "
+              f"{scaler.mean_.min():.3f} .. {scaler.mean_.max():.3f}")
+        print(f"  pre-fit train scale range: "
+              f"{scaler.scale_.min():.3f} .. {scaler.scale_.max():.3f}")
+    else:
+        print("\nnormalize: OFF (baseline, un-normalized features)")
+
     # ---- train --------------------------------------------------------
     model, history = train(
         X_train, y_train, X_val, y_val,
@@ -431,10 +467,21 @@ def main(argv=None):
         "epochs": epochs,
         "val_split": val_split,
         "seed": args.seed,
+        # Recorded so evaluate/inference know whether this head EXPECTS
+        # normalized features, instead of guessing from whether a scaler file
+        # happens to be sitting in outputs/.
+        "normalized": bool(args.normalize),
         "final_val_acc": final.get("val_acc"),
         "final_val_auc": final.get("val_auc"),
     })
     print(f"\nsaved head -> {out_path}")
+
+    if scaler is not None:
+        # Saved beside the head so evaluate.py and inference.py find it
+        # automatically and apply the IDENTICAL transform.
+        scaler_out = args.scaler_out or scaler_path_for(out_path)
+        save_scaler(scaler, scaler_out)
+        print(f"saved scaler -> {scaler_out}")
     print("NOTE: validation metrics above are NOT a test score. "
           "Run src/evaluate.py on the held-out test split for that.")
     return 0

@@ -43,12 +43,14 @@ from tqdm.auto import tqdm
 
 try:
     from src.features import get_embedder, get_fused_embeddings
-    from src.model import load_head, predict_proba
+    from src.model import (apply_scaler, load_head, predict_proba,
+                           resolve_feature_scaler)
     from src.transforms import TRANSFORM_NAMES
 except ImportError:  # pragma: no cover - sys.path shape, not logic
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.features import get_embedder, get_fused_embeddings
-    from src.model import load_head, predict_proba
+    from src.model import (apply_scaler, load_head, predict_proba,
+                           resolve_feature_scaler)
     from src.transforms import TRANSFORM_NAMES
 
 DEFAULT_CONFIG = os.path.join(
@@ -128,7 +130,7 @@ def build_eval_subset(manifest_path, per_class=500, seed=42):
 # --------------------------------------------------------------------------
 
 def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=None,
-                         embedder=None):
+                         embedder=None, scaler=None):
     """Score the head under every transform, returning a table and cached probs.
 
     Args:
@@ -138,6 +140,8 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
         batch_size: DINOv2 batch size.
         transform_names: defaults to every transform in TRANSFORM_NAMES.
         embedder: reuse an existing DinoV2Embedder.
+        scaler: optional fitted StandardScaler, applied to every
+            transform's features exactly as it was during training.
 
     Returns:
         (results_df, probs_by_transform) - the table sorted as
@@ -173,6 +177,12 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
             embedder=embedder,
             show_progress=True,
         )
+
+        # Apply the training-time scaler, if this head was trained with one.
+        # Same fitted object for every transform and every image - it is NEVER
+        # re-fit here, which would leak the test distribution into the
+        # transform and quietly flatter the results.
+        embs = apply_scaler(scaler, embs)
 
         # Sanity-check the head against the feature width before predicting,
         # so a dimension mismatch reports the cause rather than a raw shape
@@ -216,7 +226,7 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
 
 
 def diagnose_transform(model, paths, labels, name, batch_size=32, embedder=None,
-                       probs=None):
+                       probs=None, scaler=None):
     """Print a confusion matrix and per-true-class mean P(fake) for one transform.
 
     Args:
@@ -228,7 +238,8 @@ def diagnose_transform(model, paths, labels, name, batch_size=32, embedder=None,
             paths, transform_name=name, batch_size=batch_size,
             embedder=embedder, show_progress=True,
         )
-        probs = predict_proba(model, embs)
+        # Same scaler as the sweep, for the same reason.
+        probs = predict_proba(model, apply_scaler(scaler, embs))
 
     preds = probs > 0.5
     labels = np.asarray(labels)
@@ -274,6 +285,10 @@ def parse_args(argv=None):
     p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--out", default=None,
                    help="Output CSV (default: <outputs_dir>/robustness_table.csv).")
+    p.add_argument("--scaler", default=None,
+                   help="Fitted feature scaler (.pkl) from a --normalize training "
+                        "run. Default: auto-detected beside --head; if the head was "
+                        "not trained normalized, no scaling is applied.")
     p.add_argument("--per-class", type=int, default=500,
                    help="Eval images per class from the test split.")
     p.add_argument("--batch-size", type=int, default=None)
@@ -306,12 +321,16 @@ def main(argv=None):
     print(f"  head in_dim={getattr(model, 'in_dim', '?')} "
           f"hidden={getattr(model, 'hidden', '?')}")
 
+    # Decides from the head's own metadata whether normalized features are
+    # expected, so a stale scaler cannot be silently applied to a baseline head.
+    scaler, _scaler_path = resolve_feature_scaler(head_path, model, args.scaler)
+
     paths, labels = build_eval_subset(manifest, per_class=args.per_class, seed=args.seed)
 
     print(f"\nsweeping {len(TRANSFORM_NAMES)} transforms over {len(paths)} images "
           f"({len(TRANSFORM_NAMES) * len(paths)} feature extractions)...")
     results_df, probs_by_transform = run_robustness_sweep(
-        model, paths, labels, batch_size=batch_size)
+        model, paths, labels, batch_size=batch_size, scaler=scaler)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_csv)) or ".", exist_ok=True)
     results_df.to_csv(out_csv)
@@ -332,7 +351,7 @@ def main(argv=None):
         for name in diagnose:
             # Reuse the sweep's predictions - no need to re-extract.
             diagnose_transform(model, paths, labels, name, batch_size=batch_size,
-                               probs=probs_by_transform.get(name))
+                               probs=probs_by_transform.get(name), scaler=scaler)
 
     return 0
 

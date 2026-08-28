@@ -20,13 +20,26 @@ the logit is P(fake).
 """
 
 import importlib
+import os
 import pickle
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
 
-__all__ = ["Head", "predict_proba", "save_head", "load_head"]
+__all__ = [
+    "Head",
+    "predict_proba",
+    "save_head",
+    "load_head",
+    "SCALER_SUFFIX",
+    "scaler_path_for",
+    "save_scaler",
+    "load_scaler",
+    "resolve_feature_scaler",
+    "apply_scaler",
+]
 
 # Notebook defaults, kept as the module defaults so a bare Head(in_dim)
 # reproduces the notebook's model exactly.
@@ -318,4 +331,125 @@ def load_head(path, map_location="cpu"):
     model = Head(in_dim=in_dim, hidden=hidden, dropout=dropout)
     model.load_state_dict(state)
     model.eval()
+
+    # Expose the checkpoint's metadata on the returned model. Callers need it
+    # to know whether this head was trained on normalized features - see
+    # resolve_feature_scaler. Attribute only; no effect on the forward pass.
+    model.extra = ckpt.get("extra", {}) if isinstance(ckpt, dict) else {}
+
     return model
+
+
+# --------------------------------------------------------------------------
+# Optional feature scaler (the --normalize experiment)
+#
+# The fused vector concatenates two blocks on very different scales: DINOv2
+# CLS values are roughly unit-scale, while the FFT block is a log-magnitude
+# around 7.8-9.0. Z-scoring each of the 800 dimensions puts them on equal
+# footing, which may or may not help - hence an A/B toggle rather than a
+# change to the default path.
+#
+# The scaler is a *fitted* object: it carries the per-dimension mean and
+# std learned from the training features. That is exactly why it must be
+# persisted next to the head and reused verbatim at eval/inference time -
+# re-fitting on val or test would leak their distribution into the transform.
+# --------------------------------------------------------------------------
+
+# head_fused.pt -> head_fused.scaler.pkl. Named per-head rather than a single
+# shared outputs/scaler.pkl so training a second head (e.g. --augment) cannot
+# silently clobber the first one's scaler.
+SCALER_SUFFIX = ".scaler.pkl"
+
+
+def scaler_path_for(head_path):
+    """Conventional scaler path beside a head checkpoint."""
+    return os.path.splitext(head_path)[0] + SCALER_SUFFIX
+
+
+def save_scaler(scaler, path):
+    """Persist a fitted scaler with joblib."""
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    joblib.dump(scaler, path)
+
+
+def load_scaler(path):
+    """Load a fitted scaler written by ``save_scaler``."""
+    return joblib.load(path)
+
+
+def apply_scaler(scaler, features):
+    """Transform features with a fitted scaler; a no-op when scaler is None.
+
+    Casts back to float32: StandardScaler.transform promotes to float64, and
+    the un-normalized path feeds float32, so this keeps the dtype (and memory
+    footprint) identical between the two branches.
+    """
+    if scaler is None:
+        return features
+    return scaler.transform(features).astype(np.float32)
+
+
+def resolve_feature_scaler(head_path, model=None, explicit=None, quiet=False):
+    """Decide which scaler (if any) to apply for a given head.
+
+    Auto-detection alone is unsafe: a stale scaler left in outputs/ from an
+    earlier normalized run would get silently applied to an un-normalized
+    head, quietly corrupting every prediction. So the head's own record of how
+    it was trained (``extra["normalized"]``, written by src/train.py) is the
+    authority, and a discovered file is only honoured when it agrees.
+
+    Args:
+        head_path: path the head was loaded from (used to locate the scaler).
+        model: the loaded Head, for its ``extra`` metadata. Optional.
+        explicit: an explicitly requested scaler path (--scaler). Wins over
+            both auto-detection and the head's metadata.
+        quiet: suppress the informational prints.
+
+    Returns:
+        (scaler_or_None, path_or_None).
+
+    Raises:
+        SystemExit: if the head was trained normalized but no scaler is
+            available, or an explicitly named scaler is missing.
+    """
+    extra = getattr(model, "extra", None) or {}
+    was_normalized = extra.get("normalized")
+
+    if explicit:
+        if not os.path.exists(explicit):
+            raise SystemExit(f"--scaler not found: {explicit}")
+        if was_normalized is False:
+            print(f"WARNING: {head_path} records normalized=False, but "
+                  f"--scaler was given explicitly; applying it anyway.")
+        if not quiet:
+            print(f"feature scaler: {explicit} (explicit)")
+        return load_scaler(explicit), explicit
+
+    # Candidates: the per-head name first, then the generic name in the same
+    # directory (so a hand-placed outputs/scaler.pkl is still found).
+    candidates = [
+        scaler_path_for(head_path),
+        os.path.join(os.path.dirname(os.path.abspath(head_path)), "scaler.pkl"),
+    ]
+    found = next((c for c in candidates if os.path.exists(c)), None)
+
+    if was_normalized is True:
+        if found is None:
+            raise SystemExit(
+                f"{head_path} was trained with --normalize, but no scaler was "
+                f"found. Predictions would be wrong without it. Looked for:\n"
+                + "\n".join(f"  {c}" for c in candidates)
+                + "\nPass --scaler explicitly, or retrain."
+            )
+        if not quiet:
+            print(f"feature scaler: {found} (head was trained normalized)")
+        return load_scaler(found), found
+
+    # Head was trained un-normalized, or predates the flag: keep the baseline
+    # behaviour and say so if a scaler was lying around.
+    if found is not None and not quiet:
+        print(f"NOTE: found {found}, but {head_path} was not trained with "
+              f"--normalize, so it is being IGNORED. Pass --scaler to force it.")
+    return None, None

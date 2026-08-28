@@ -41,13 +41,15 @@ from PIL import Image
 
 try:
     from src.features import get_fused_embeddings
-    from src.model import load_head, predict_proba
+    from src.model import (apply_scaler, load_head, predict_proba,
+                           resolve_feature_scaler)
 except ImportError:  # pragma: no cover - sys.path shape, not logic
     # Lets the script run as `python src/inference.py` or, as the notebook
     # does, as `python inference.py` from inside the src/ directory.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.features import get_fused_embeddings
-    from src.model import load_head, predict_proba
+    from src.model import (apply_scaler, load_head, predict_proba,
+                           resolve_feature_scaler)
 
 # Superset of the manifest builder's extensions (which used jpg/jpeg/png), so
 # an unexpected format in a demo folder isn't silently ignored.
@@ -104,7 +106,7 @@ def filter_readable(paths):
 # Prediction
 # --------------------------------------------------------------------------
 
-def predict_paths(paths, weights_path, batch_size=32):
+def predict_paths(paths, weights_path, batch_size=32, scaler_path=None):
     """Score a list of image paths, returning P(AI-generated) per image.
 
     Args:
@@ -112,6 +114,9 @@ def predict_paths(paths, weights_path, batch_size=32):
         weights_path: head checkpoint (.pt) from src/train.py, or the
             notebook's bare state_dict.
         batch_size: images per DINOv2 forward pass.
+        scaler_path: explicit fitted-scaler path. Default: auto-detected
+            beside the weights, and only applied if the head records that it
+            was trained on normalized features.
 
     Returns:
         float64 numpy array of shape (len(paths),), values in [0, 1].
@@ -120,12 +125,20 @@ def predict_paths(paths, weights_path, batch_size=32):
     in_dim = getattr(model, "in_dim", None)
     print(f"loaded head: {weights_path}  (in_dim={in_dim})")
 
+    # No scaler -> apply_scaler is a no-op and behaviour is exactly as before.
+    scaler, _ = resolve_feature_scaler(weights_path, model, scaler_path)
+
     # transform_name="clean" - the identity. Inference scores images as they
     # arrive; the degradation transforms exist only for the robustness sweep
     # in src/evaluate.py and for --augment training.
     features = get_fused_embeddings(
         paths, transform_name="clean", batch_size=batch_size, show_progress=True
     )
+
+    # Reuse the training-time transform verbatim; never re-fit on the images
+    # being scored, which would make each run's output depend on whatever
+    # folder happened to be passed in.
+    features = apply_scaler(scaler, features)
 
     # Fail with a readable message if the head predates a feature change,
     # rather than surfacing a bare matmul shape error from torch.
@@ -184,6 +197,10 @@ def parse_args(argv=None):
                    help="Destination JSON path.")
     p.add_argument("--batch_size", type=int, default=32,
                    help="Images per DINOv2 forward pass (default: 32).")
+    p.add_argument("--scaler", default=None,
+                   help="Fitted feature scaler (.pkl) from a --normalize training "
+                        "run. Default: auto-detected beside --weights; ignored if "
+                        "the head was not trained normalized.")
     return p.parse_args(argv)
 
 
@@ -210,7 +227,8 @@ def main(argv=None):
         print("no readable images; writing an empty prediction list")
         records = []
     else:
-        probs = predict_paths(readable, args.weights, batch_size=args.batch_size)
+        probs = predict_paths(readable, args.weights, batch_size=args.batch_size,
+                              scaler_path=args.scaler)
         records = build_records(readable, probs)
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
