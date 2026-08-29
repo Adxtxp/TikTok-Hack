@@ -37,11 +37,18 @@ import argparse
 import os
 import sys
 
-import numpy as np
-import pandas as pd
+# torch MUST be imported before pandas. On Windows, importing pandas first
+# makes torch's DLL initialisation fail with:
+#   OSError: [WinError 1114] A dynamic link library (DLL) initialization
+#   routine failed. Error loading ".../torch/lib/c10.dll"
+# Harmless on Colab/Linux, so this ordering is kept unconditionally rather
+# than guarded by a platform check.
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+import numpy as np
+import pandas as pd
 import yaml
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split

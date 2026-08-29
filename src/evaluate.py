@@ -35,6 +35,15 @@ import argparse
 import os
 import sys
 
+# Imported for its side effect only: torch MUST initialise before pandas or,
+# on Windows, its DLL setup fails with:
+#   OSError: [WinError 1114] A dynamic link library (DLL) initialization
+#   routine failed. Error loading ".../torch/lib/c10.dll"
+# This module never calls torch directly - it reaches it through src.features
+# and src.model below, which import too late to fix the ordering. Do not
+# "clean up" this apparently unused import.
+import torch  # noqa: F401
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
