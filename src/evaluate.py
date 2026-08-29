@@ -32,8 +32,10 @@ estimate - provided you do not start tuning against them.
 """
 
 import argparse
+import json
 import os
 import sys
+from datetime import datetime, timezone
 
 # Imported for its side effect only: torch MUST initialise before pandas or,
 # on Windows, its DLL setup fails with:
@@ -46,7 +48,8 @@ import torch  # noqa: F401
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
+                             confusion_matrix, roc_auc_score)
 # tqdm.auto renders as a widget in Colab and a text bar under `python -m`.
 from tqdm.auto import tqdm
 
@@ -135,11 +138,208 @@ def build_eval_subset(manifest_path, per_class=500, seed=42):
 
 
 # --------------------------------------------------------------------------
+# Threshold tuning
+#
+# Predictions are thresholded at 0.5 by default, which is only optimal when the
+# score distributions happen to straddle it symmetrically. Moving the cut can
+# recover accuracy for free - no retraining, no extra features - and it matters
+# most under degradation, where the whole score distribution tends to drift
+# toward 0.5 and a fixed cut throws away separation the model still has.
+#
+# LEAKAGE RULE: the threshold is a fitted parameter. It is chosen on the
+# VALIDATION split only - the same rows train.py held out - and then applied
+# unchanged to the test split. Picking it on test would tune a parameter on the
+# data used to report the result, which is exactly the leak this repo's
+# train/val/test discipline exists to prevent.
+# --------------------------------------------------------------------------
+
+def tune_threshold(model, X_val, y_val, lo=0.05, hi=0.95, step=0.01):
+    """Sweep decision thresholds on validation data; return the best.
+
+    Selection metric is BALANCED accuracy - the mean of per-class recall.
+    Plain accuracy would let the sweep drift toward whichever class is larger
+    if the validation fold is even slightly imbalanced, which is the opposite
+    of what a threshold should do.
+
+    Args:
+        model: a Head.
+        X_val: (N, in_dim) validation features - already scaled if the head
+            was trained on normalized features.
+        y_val: (N,) 0/1 labels.
+        lo, hi, step: threshold grid bounds and resolution.
+
+    Returns:
+        dict with the chosen threshold, both metrics at 0.5 and at the chosen
+        threshold, and the full (threshold, balanced_accuracy) curve.
+    """
+    if len(X_val) == 0:
+        raise ValueError("threshold tuning needs a non-empty validation set")
+    if len(np.unique(y_val)) < 2:
+        raise ValueError(
+            "validation fold is single-class; balanced accuracy is degenerate "
+            "and the tuned threshold would be meaningless"
+        )
+
+    probs = predict_proba(model, X_val)
+
+    # np.arange on floats drifts; round to the step's precision so the grid
+    # contains exact values like 0.50 rather than 0.5000000001.
+    decimals = max(0, int(round(-np.log10(step))))
+    grid = np.round(np.arange(lo, hi + step / 2, step), decimals)
+
+    curve = [(float(t), float(balanced_accuracy_score(y_val, probs > t)))
+             for t in grid]
+
+    # Tie-break toward 0.5: when several thresholds score identically, prefer
+    # the least deviation from the default rather than an arbitrary grid edge.
+    best_t, best_bal = min(curve, key=lambda tb: (-tb[1], abs(tb[0] - 0.5)))
+
+    return {
+        "threshold": best_t,
+        "bal_acc_tuned": best_bal,
+        "acc_tuned": float(accuracy_score(y_val, probs > best_t)),
+        "bal_acc_at_0.5": float(balanced_accuracy_score(y_val, probs > 0.5)),
+        "acc_at_0.5": float(accuracy_score(y_val, probs > 0.5)),
+        "n_val": int(len(y_val)),
+        "curve": curve,
+    }
+
+
+# The tuned threshold lives in a sidecar file, NOT in the head checkpoint.
+# evaluate.py is an evaluation script: mutating the training artifact it is
+# measuring would make the head's bytes depend on which analyses happened to be
+# run against it, and a re-tune would rewrite weights it has no business
+# touching. A sidecar keeps the head immutable and the threshold optional.
+#
+# outputs/head_fused.pt -> outputs/head_fused.threshold.json
+# (same per-head naming convention as the scaler in src/model.py)
+THRESHOLD_SUFFIX = ".threshold.json"
+
+
+def threshold_path_for(head_path):
+    """Conventional sidecar path beside a head checkpoint."""
+    return os.path.splitext(head_path)[0] + THRESHOLD_SUFFIX
+
+
+def save_threshold(path, tuned, head_path=None):
+    """Write the tuned threshold and its provenance to a JSON sidecar.
+
+    Provenance is recorded because a bare number is not auditable: the reader
+    needs to know it was selected on validation (not test), how well it scored,
+    and against which head.
+    """
+    payload = {
+        "threshold": float(tuned["threshold"]),
+        "selected_on": "validation",
+        "metric": "balanced_accuracy",
+        "val_balanced_accuracy": float(tuned["bal_acc_tuned"]),
+        "val_accuracy": float(tuned["acc_tuned"]),
+        "val_balanced_accuracy_at_0.5": float(tuned["bal_acc_at_0.5"]),
+        "val_accuracy_at_0.5": float(tuned["acc_at_0.5"]),
+        "n_val": int(tuned["n_val"]),
+        "head": os.path.basename(head_path) if head_path else None,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return payload
+
+
+def load_threshold(head_path, explicit=None, default=0.5):
+    """Read a tuned threshold from its sidecar, falling back to ``default``.
+
+    This is the reader consumers should use (e.g. if inference.py later grows a
+    --threshold option) instead of looking inside the head's metadata, which no
+    longer carries the value.
+
+    Returns:
+        (threshold, path_or_None). ``path`` is None when no sidecar was found,
+        in which case ``threshold`` is ``default``.
+    """
+    path = explicit or threshold_path_for(head_path)
+    if not os.path.exists(path):
+        if explicit:
+            raise SystemExit(f"threshold sidecar not found: {path}")
+        return default, None
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if "threshold" not in payload:
+        raise SystemExit(f"{path} has no 'threshold' key")
+    return float(payload["threshold"]), path
+
+
+def build_val_features(manifest_path, model, batch_size=32, scaler=None,
+                       embedder=None):
+    """Rebuild the exact validation split train.py held out, with features.
+
+    evaluate.py otherwise only ever touches the test split, so the validation
+    rows have to be reconstructed here. That is safe only if the split is
+    reproduced identically, which is why ``val_split`` and ``seed`` are read
+    from the HEAD'S OWN metadata rather than from this script's --seed (which
+    seeds eval-subset sampling and is a different number entirely). A
+    mismatched seed would hand back rows the head actually trained on, and the
+    tuned threshold would be fitted on seen data.
+
+    Returns:
+        (X_val, y_val). Never contains test-split rows: the manifest is
+        filtered to split == "train" before the val split is drawn.
+    """
+    # Imported lazily: keeps evaluate.py's import cost unchanged when
+    # --tune-threshold is off, and reuses train.py's split helpers rather than
+    # duplicating them, so the two cannot drift apart.
+    try:
+        from src.train import _split_train_val, load_train_rows
+    except ImportError:  # pragma: no cover - sys.path shape, not logic
+        from train import _split_train_val, load_train_rows
+
+    extra = getattr(model, "extra", None) or {}
+    val_split = extra.get("val_split")
+    seed = extra.get("seed")
+
+    if val_split is None or seed is None:
+        raise SystemExit(
+            "cannot reconstruct the validation split: this head's metadata has "
+            f"no val_split/seed (got val_split={val_split}, seed={seed}). It "
+            "predates that metadata - retrain it, or skip --tune-threshold."
+        )
+
+    print()
+    print(f"reconstructing the training validation split "
+          f"(val_split={val_split}, seed={seed}, from the head's metadata)")
+    paths, labels = load_train_rows(manifest_path)
+    _train_idx, val_idx = _split_train_val(len(paths), labels, val_split, seed)
+
+    if len(val_idx) == 0:
+        raise SystemExit(
+            "the head was trained with val_split=0, so there is no held-out "
+            "validation set to tune a threshold on"
+        )
+
+    val_paths = [paths[i] for i in val_idx]
+    y_val = labels[val_idx]
+    print(f"  {len(val_paths)} validation rows (never in the test split, and "
+          f"held out of this head's training)")
+
+    X_val = get_fused_embeddings(
+        val_paths, transform_name="clean", batch_size=batch_size,
+        embedder=embedder, show_progress=True,
+    )
+    # Same transform the head was trained with; skipped when scaler is None.
+    X_val = apply_scaler(scaler, X_val)
+    return X_val, y_val
+
+
+# --------------------------------------------------------------------------
 # Robustness sweep
 # --------------------------------------------------------------------------
 
 def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=None,
-                         embedder=None, scaler=None):
+                         embedder=None, scaler=None, threshold=None):
     """Score the head under every transform, returning a table and cached probs.
 
     Args:
@@ -151,6 +351,9 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
         embedder: reuse an existing DinoV2Embedder.
         scaler: optional fitted StandardScaler, applied to every
             transform's features exactly as it was during training.
+        threshold: optional validation-tuned decision threshold. When given,
+            extra columns report accuracy at this cut alongside the 0.5
+            baseline, so the recovery per degradation is visible.
 
     Returns:
         (results_df, probs_by_transform) - the table sorted as
@@ -209,14 +412,28 @@ def run_robustness_sweep(model, paths, labels, batch_size=32, transform_names=No
 
         acc = accuracy_score(labels, preds)
         auc = roc_auc_score(labels, probs) if len(np.unique(labels)) > 1 else float("nan")
+
+        row = {"transform": name, "accuracy": acc, "auc": auc}
+
+        if threshold is not None:
+            # The threshold was fitted on validation; applying it to test here
+            # is the honest direction. AUC is threshold-free so it is unchanged.
+            tuned_preds = probs > threshold
+            row["accuracy_tuned"] = accuracy_score(labels, tuned_preds)
+            row["bal_acc_tuned"] = balanced_accuracy_score(labels, tuned_preds)
+            row["acc_gain_vs_0.5"] = row["accuracy_tuned"] - acc
         # ---------------------------------------------------------------
 
-        rows.append({"transform": name, "accuracy": acc, "auc": auc})
+        rows.append(row)
         probs_by_transform[name] = probs
         # tqdm.write instead of print: a bare print() while a bar is live
         # interleaves with the bar's carriage returns and garbles both. Same
         # text, just routed so tqdm can redraw around it.
-        tqdm.write(f"  {name:<14} accuracy {acc:.4f}   auc {auc:.4f}")
+        line = f"  {name:<14} accuracy {acc:.4f}   auc {auc:.4f}"
+        if threshold is not None:
+            line += (f"   tuned@{threshold:.2f} {row['accuracy_tuned']:.4f}"
+                     f" ({row['acc_gain_vs_0.5']:+.4f})")
+        tqdm.write(line)
         # Keeps the latest score visible on the bar itself.
         sweep.set_postfix(acc=f"{acc:.4f}", auc=f"{auc:.4f}")
 
@@ -298,6 +515,11 @@ def parse_args(argv=None):
                    help="Fitted feature scaler (.pkl) from a --normalize training "
                         "run. Default: auto-detected beside --head; if the head was "
                         "not trained normalized, no scaling is applied.")
+    p.add_argument("--tune-threshold", action="store_true",
+                   help="Tune the decision threshold on the VALIDATION split "
+                        "(reconstructed from the head's val_split/seed), report "
+                        "0.5 vs tuned accuracy, and record it in the head. "
+                        "Default off - the 0.5 cut is unchanged.")
     p.add_argument("--per-class", type=int, default=500,
                    help="Eval images per class from the test split.")
     p.add_argument("--batch-size", type=int, default=None)
@@ -334,12 +556,43 @@ def main(argv=None):
     # expected, so a stale scaler cannot be silently applied to a baseline head.
     scaler, _scaler_path = resolve_feature_scaler(head_path, model, args.scaler)
 
+    # ---- optional threshold tuning, on VALIDATION data only ----------
+    # Runs before the sweep so the chosen cut can be reported per transform.
+    # Note the test split has not been loaded at this point.
+    threshold = None
+    if args.tune_threshold:
+        X_val, y_val = build_val_features(
+            manifest, model, batch_size=batch_size, scaler=scaler)
+        tuned = tune_threshold(model, X_val, y_val)
+        threshold = tuned["threshold"]
+
+        print()
+        print("================ THRESHOLD TUNING (validation) ================")
+        print(f"  validation rows:        {tuned['n_val']}")
+        print(f"  default threshold 0.50: accuracy {tuned['acc_at_0.5']:.4f}  "
+              f"balanced {tuned['bal_acc_at_0.5']:.4f}")
+        print(f"  tuned threshold   {threshold:.2f}: accuracy {tuned['acc_tuned']:.4f}  "
+              f"balanced {tuned['bal_acc_tuned']:.4f}")
+        print(f"  improvement (balanced): "
+              f"{tuned['bal_acc_tuned'] - tuned['bal_acc_at_0.5']:+.4f}")
+        print(f"  chosen threshold: {threshold:.2f}")
+        print("  (selected on validation; applied unchanged to test below)")
+        print("==============================================================")
+
+        # Written beside the head, never into it: the head checkpoint stays
+        # byte-for-byte as training produced it.
+        sidecar = threshold_path_for(head_path)
+        save_threshold(sidecar, tuned, head_path=head_path)
+        print(f"wrote threshold sidecar -> {sidecar}")
+        print("  (the head checkpoint was NOT modified)")
+
     paths, labels = build_eval_subset(manifest, per_class=args.per_class, seed=args.seed)
 
     print(f"\nsweeping {len(TRANSFORM_NAMES)} transforms over {len(paths)} images "
           f"({len(TRANSFORM_NAMES) * len(paths)} feature extractions)...")
     results_df, probs_by_transform = run_robustness_sweep(
-        model, paths, labels, batch_size=batch_size, scaler=scaler)
+        model, paths, labels, batch_size=batch_size, scaler=scaler,
+        threshold=threshold)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_csv)) or ".", exist_ok=True)
     results_df.to_csv(out_csv)
