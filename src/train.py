@@ -232,11 +232,28 @@ def train(
     dropout=0.2,
     device=None,
     seed=42,
+    patience=5,
 ):
     """Fit a Head with mini-batch Adam, reporting validation metrics per epoch.
 
+    Early stopping on validation AUC: the best-scoring epoch's weights are
+    kept, and training halts once ``patience`` consecutive epochs fail to beat
+    that best. AUC rather than accuracy because it is threshold-free - it moves
+    when the score distributions separate further, while accuracy can sit
+    frozen for several epochs at a fixed 0.5 cut and make a still-improving
+    model look plateaued.
+
+    ``epochs`` is therefore a ceiling, not a target.
+
+    Args:
+        patience: epochs without a val-AUC improvement before stopping.
+            0 (or no validation set) disables early stopping, in which case the
+            full ``epochs`` are run and the last epoch's weights are kept.
+
     Returns:
-        (model, history) where history is a list of per-epoch metric dicts.
+        (model, history). The model carries the weights from the BEST epoch,
+        not the last one. Each history entry gains a "best" flag marking which
+        epoch that was.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -255,6 +272,22 @@ def train(
 
     print(f"\ntraining: {n} train / {len(X_val)} val rows, in_dim={in_dim}, "
           f"device={device}, {epochs} epochs x {max(1, n // batch_size)} steps")
+
+    # Early-stopping state. Needs a validation set to have anything to watch.
+    early_stop = bool(patience) and patience > 0 and len(X_val) > 0
+    if early_stop:
+        print(f"early stopping: on val AUC, patience {patience} "
+              f"({epochs} epochs is the maximum)")
+    else:
+        print(f"early stopping: DISABLED "
+              f"({'no validation rows' if len(X_val) == 0 else f'patience={patience}'})"
+              f" - running all {epochs} epochs")
+
+    best_auc = float("-inf")
+    best_epoch = None
+    best_state = None
+    stale_epochs = 0
+    warned_no_auc = False
 
     history = []
     for epoch in range(epochs):
@@ -299,8 +332,54 @@ def train(
 
         acc_s = "n/a" if val_acc is None else f"{val_acc:.4f}"
         auc_s = "n/a" if val_auc is None else f"{val_auc:.4f}"
+        marker = ""
+
+        # ---- early stopping bookkeeping --------------------------------
+        if early_stop and val_auc is None:
+            # A single-class validation fold makes AUC undefined; without a
+            # signal there is nothing to stop on, so fall back to running out
+            # the epochs rather than stopping arbitrarily.
+            if not warned_no_auc:
+                print("  (val AUC undefined - early stopping inactive this run)")
+                warned_no_auc = True
+        elif early_stop:
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_epoch = epoch
+                # Detached clones: state_dict() hands back live references, so
+                # without copying, the next optimizer.step() would overwrite
+                # the very weights we are trying to preserve.
+                best_state = {k: v.detach().clone()
+                              for k, v in model.state_dict().items()}
+                stale_epochs = 0
+                marker = "  <- best"
+            else:
+                stale_epochs += 1
+                marker = f"  (no improvement, {stale_epochs}/{patience})"
+
         print(f"epoch {epoch + 1:>3}/{epochs}  train_loss {train_loss:.4f}  "
-              f"val_acc {acc_s}  val_auc {auc_s}")
+              f"val_acc {acc_s}  val_auc {auc_s}{marker}")
+
+        if early_stop and stale_epochs >= patience:
+            print(f"\nEARLY STOP at epoch {epoch + 1}/{epochs}: val AUC has not "
+                  f"improved for {patience} consecutive epoch(s).")
+            print(f"  best epoch: {best_epoch + 1} (val_auc {best_auc:.4f})")
+            print(f"  skipped {epochs - (epoch + 1)} remaining epoch(s)")
+            break
+
+    # Roll back to the best epoch. Done whether or not early stopping fired,
+    # because the last epoch is often slightly worse than the best even in a
+    # run that goes the full distance - which is exactly the mild overfitting
+    # this is meant to avoid.
+    if best_epoch is not None:
+        history[best_epoch]["best"] = True
+        if best_epoch != len(history) - 1:
+            model.load_state_dict(best_state)
+            print(f"\nrestored weights from best epoch {best_epoch + 1} "
+                  f"(val_auc {best_auc:.4f}); epoch {len(history)}'s weights discarded")
+        else:
+            print(f"\nbest epoch was the last one ({best_epoch + 1}, "
+                  f"val_auc {best_auc:.4f}); no rollback needed")
 
     return model, history
 
@@ -318,7 +397,12 @@ def parse_args(argv=None):
     p.add_argument("--out", default=None,
                    help="Where to write the head checkpoint (.pt).")
     p.add_argument("--epochs", type=int, default=None,
-                   help="Training epochs (default: config epochs).")
+                   help="MAXIMUM training epochs (default: config epochs). Early "
+                        "stopping usually ends the run before this.")
+    p.add_argument("--patience", type=int, default=5,
+                   help="Stop after this many epochs with no val-AUC improvement, "
+                        "keeping the best epoch's weights. 0 disables early "
+                        "stopping and runs all --epochs. Default 5.")
     p.add_argument("--augment", action="store_true",
                    help="Apply a random transform per training image before feature "
                         "extraction, to train for robustness. Validation stays clean.")
@@ -454,6 +538,7 @@ def main(argv=None):
         X_train, y_train, X_val, y_val,
         epochs=epochs, batch_size=batch_size, learning_rate=lr,
         hidden=args.hidden, dropout=args.dropout, seed=args.seed,
+        patience=args.patience,
     )
 
     # ---- save ---------------------------------------------------------
@@ -461,10 +546,17 @@ def main(argv=None):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    final = history[-1] if history else {}
+    # The saved weights come from the best epoch, so the recorded metrics must
+    # too - taking history[-1] here would pair best-epoch weights with a
+    # different epoch's numbers.
+    best = next((h for h in history if h.get("best")), None)
+    final = best if best is not None else (history[-1] if history else {})
     save_head(model, out_path, extra={
         "augmented": bool(args.augment),
         "epochs": epochs,
+        "epochs_run": len(history),
+        "patience": args.patience,
+        "best_epoch": (final.get("epoch") + 1) if final.get("epoch") is not None else None,
         "val_split": val_split,
         "seed": args.seed,
         # Recorded so evaluate/inference know whether this head EXPECTS
