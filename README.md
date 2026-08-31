@@ -17,17 +17,9 @@ Labels: `0` = real, `1` = AI-generated.
 
 ## Approach
 
-**Two complementary feature families, fused.**
+**Feature extraction, and an ablation that reshaped it.** We initially fused two feature families into an 800-d vector per image: the frozen DINOv2 (`facebook/dinov2-base`) CLS token (768-d), capturing semantic and structural implausibility, and a radial FFT log-magnitude profile (32-d), capturing the generator's periodic upsampling fingerprint.
 
-| feature | dim | catches | weakness |
-|---|---|---|---|
-| Frozen DINOv2 (`facebook/dinov2-base`) CLS token | 768 | semantic and structural implausibility — anatomy, lighting, material texture | can miss clean-looking synthetic images |
-| Radial FFT log-magnitude profile | 32 | the generator fingerprint — periodic upsampling artifacts from diffusion/GAN decoders | destroyed by JPEG and blur |
-
-Concatenated into one **800-d** vector per image. The two halves fail in
-different ways: a DINOv2-only detector misses obvious checkerboard artifacts,
-an FFT-only detector collapses the moment an image is recompressed. Fusing
-them lets the classifier weigh both.
+We then tested whether fusion actually helped, with an ablation across the full 15-transform grid: DINOv2-only vs. FFT-only vs. fused. The result was informative and against our initial assumption — **DINOv2-only matched or outperformed the fused model on every degradation, even after z-score normalizing the two feature blocks.** We attribute this to CIFAKE's 32×32 resolution, which leaves the FFT branch little exploitable frequency signal. Following the evidence, our final model uses the DINOv2 branch alone. The fusion path remains in `features.py` and can be re-enabled with a flag; we expect the frequency branch to contribute on higher-resolution imagery — a direction for future work.
 
 **A small trained head, a frozen backbone.** The DINOv2 backbone is never
 fine-tuned — `requires_grad = False`, `.eval()`. Only a
@@ -65,6 +57,28 @@ endpoints) so the robustness table is reproducible.
 validation set from the training rows only, so no model-selection decision is
 informed by test data.
 
+## Results
+
+Held-out test set, 15 transform conditions. Headline finding: augmentation-aware training recovers **+24 to +32 accuracy points** on the hardest degradations, at a cost of only ~2% on clean images. The augmented model stays **above 85% on every transform** — no remaining catastrophic failure mode.
+
+| Transform | Clean-trained | Augmented-trained | Change |
+|---|---|---|---|
+| clean | 97.1% | 95.5% | -1.6% |
+| jpeg_90 | 96.7% | 95.5% | -1.2% |
+| jpeg_70 | 96.4% | 95.8% | -0.6% |
+| jpeg_50 | 91.8% | 93.9% | +2.1% |
+| jpeg_30 | 88.9% | 94.0% | +5.1% |
+| blur_0.5 | 92.5% | 94.9% | +2.4% |
+| blur_1.0 | 62.4% | 92.0% | **+29.6%** |
+| blur_2.0 | 58.2% | 85.2% | **+27.0%** |
+| resize_0.5 | 61.1% | 90.0% | **+28.9%** |
+| resize_0.25 | 53.4% | 85.7% | **+32.3%** |
+| noise_0.02 | 90.7% | 94.7% | +4.0% |
+| noise_0.05 | 79.4% | 93.2% | +13.8% |
+| noise_0.10 | 64.5% | 88.1% | **+23.6%** |
+| color_jitter | 97.2% | 95.1% | -2.1% |
+| crop_80 | 86.8% | 93.0% | +6.2% |
+
 ## Repository layout
 
 ```
@@ -75,6 +89,7 @@ src/
   train.py        CLI: train/val split, mini-batch Adam, --augment
   evaluate.py     CLI: robustness sweep -> CSV, confusion-matrix diagnosis
   inference.py    CLI: image folder -> predictions.json
+  demoApp.py      CLI: create the UI to upload image to test for real or fake
 notebooks/
   run_on_colab.ipynb   thin GPU orchestrator; no model logic
 configs/default.yaml   model id, batch size, epochs, lr, val_split, paths
@@ -101,7 +116,7 @@ matching your CUDA driver (and so Colab's preinstalled build is left alone).
 **`albumentations` must be >= 2.0** — the transforms use the `quality_range`
 and `std_range` argument names introduced there.
 
-For Colab, skip all of the above and open `notebooks/run_on_colab.ipynb`.
+For Colab, skip all of the above and open `notebooks/tech-jam.ipynb`.
 
 ## Reproducing the results
 
@@ -215,14 +230,10 @@ _To be filled in after the first full GPU run._
 
 ## Team contributions
 
-_Fill in before submission._
-
-| member | contributions |
-|---|---|
-| _name_ | _e.g. feature fusion, DINOv2 integration_ |
-| _name_ | _e.g. robustness transform grid, evaluation harness_ |
-| _name_ | _e.g. training pipeline, augmentation strategy_ |
-| _name_ | _e.g. inference CLI, Colab orchestration, README_ |
+- **[Lakshmi]** — [role, e.g. feature pipeline & DINOv2 integration]
+- **[Isaac]** — [role, e.g. training, augmentation & evaluation]
+- **[Aditi]** — [role, e.g. ablation studies & analysis]
+- **[Erin]** — [role, e.g. demo app & presentation]
 
 ## Acknowledgements
 
