@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image
 
 from src.features import get_fused_embeddings, DinoV2Embedder, fft_feature_vector
-from src.model import load_head
+from src.model import load_head, predict_proba
 from src.transforms import apply_transform, TRANSFORM_NAMES
 
 # ---- load the model once at import ----------------------------------------
@@ -66,7 +66,7 @@ def predict(image, transform_name):
 
     head, _ = _get_models()
     feats = _embed_single_pil(shown)
-    prob = float(head.predict_proba(feats)[0])       # P(AI-generated)
+    prob = float(predict_proba(head, feats)[0])       # P(AI-generated)
 
     verdict = "AI-GENERATED" if prob > 0.5 else "REAL"
     confidence = prob if prob > 0.5 else (1.0 - prob)
