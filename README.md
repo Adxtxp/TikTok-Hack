@@ -219,21 +219,12 @@ their data-handling logic is unit-tested, but no full GPU training or
 evaluation run has been completed against real weights; the numbers the
 pipeline produces have yet to be recorded here.
 
-## Results
-
-_To be filled in after the first full GPU run._
-
-| transform | accuracy | AUC | drop vs clean |
-|---|---|---|---|
-| clean | — | — | — |
-| … | | | |
-
 ## Team contributions
 
-- **[Lakshmi]** — [role, e.g. feature pipeline & DINOv2 integration]
-- **[Isaac]** — [role, e.g. training, augmentation & evaluation]
-- **[Aditi]** — [role, e.g. ablation studies & analysis]
-- **[Erin]** — [role, e.g. demo app & presentation]
+- **[Lakshmi]** — [role - feature pipeline & DINOv2 integration]
+- **[Isaac]** — [role - training, augmentation & evaluation]
+- **[Aditi]** — [role - ablation studies, presentation & analysis]
+- **[Erin]** — [role - evaluation, fine-tuning & demo app]
 
 ## Acknowledgements
 
