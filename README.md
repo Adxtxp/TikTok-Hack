@@ -92,6 +92,7 @@ src/
   demoApp.py      CLI: create the UI to upload image to test for real or fake
 notebooks/
   run_on_colab.ipynb   thin GPU orchestrator; no model logic
+  tech-jam.ipynb       final file to run
 configs/default.yaml   model id, batch size, epochs, lr, val_split, paths
 outputs/               generated artifacts (gitignored)
 run_on_colab.ipynb     the original exploratory notebook, kept for provenance
